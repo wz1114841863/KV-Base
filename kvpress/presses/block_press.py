@@ -76,7 +76,7 @@ class BlockPress(BasePress):
             current_indices = torch.cat([kept_indices, current_indices], dim=-1)
 
             # Gather hidden states for the selected indices, then restore the shape
-            # Check tests/presses/test_block_press.py for correctness verification of gathered hidden states
+            # Gather hidden states with the same token indices as the candidate KV pairs.
             current_states = states.gather(2, current_indices.unsqueeze(-1).expand(-1, -1, -1, states.shape[-1]))
             current_states = current_states.transpose(1, 2).reshape(bsz, -1, hidden_states.shape[-1])
 

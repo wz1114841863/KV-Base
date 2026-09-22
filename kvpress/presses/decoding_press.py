@@ -12,6 +12,7 @@ from transformers import PreTrainedModel
 from transformers.cache_utils import QuantizedCache
 
 from kvpress.presses.adakv_press import AdaKVPress
+from kvpress.context import KVPhase
 from kvpress.presses.base_press import BasePress, is_prefilling
 from kvpress.presses.scorer_press import ScorerPress
 from kvpress.utils import extract_keys_and_values
@@ -125,8 +126,11 @@ class DecodingPress(BasePress):
         q_len = hidden_states.shape[1]
         layer_idx = module.layer_idx
 
+        keys, values = extract_keys_and_values(cache, layer_idx)
+        context = self._make_context(module, kwargs, output, hidden_states, keys, values)
+
         # Only operate during decoding phase (after prefilling)
-        if is_prefilling(kwargs["cache_position"], q_len):
+        if context.phase is KVPhase.PREFILL:
             # We're still in prefilling phase, don't do anything
             return output
         # print(f"Adding hidden states to buffer: {hidden_states.shape}")
@@ -144,7 +148,6 @@ class DecodingPress(BasePress):
             )
 
             cache_layer = cache.layers[module.layer_idx]
-            keys, values = extract_keys_and_values(cache, module.layer_idx)
 
             # Get attention weights from output
             attentions = output[1] if len(output) > 1 and output[1] is not None else None
@@ -182,6 +185,7 @@ class DecodingPress(BasePress):
         """Reset the decoding press state."""
         self.hidden_states_buffer = defaultdict(list)
         self.layer_step_counts = defaultdict(int)
+        self._reset_context_state()
 
     @contextmanager
     def __call__(self, model: PreTrainedModel):

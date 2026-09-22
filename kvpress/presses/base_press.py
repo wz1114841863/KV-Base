@@ -20,6 +20,7 @@ from transformers import (
     Qwen3ForCausalLM,
 )
 
+from kvpress.context import KVContext, KVExecutionLifecycle, KVPhase, is_prefilling
 from kvpress.utils import extract_keys_and_values
 
 logger = logging.getLogger(__name__)
@@ -32,12 +33,6 @@ SUPPORTED_MODELS = (
     Qwen3ForCausalLM,
     Gemma3ForConditionalGeneration,
 )
-
-
-def is_prefilling(cache_position: torch.Tensor, q_len: int) -> bool:
-    """Return whether the current forward pass is the initial prefill."""
-    prefilling = cache_position[-1] + 1 == q_len
-    return bool(prefilling.item() if isinstance(prefilling, torch.Tensor) else prefilling)
 
 
 @dataclass
@@ -57,6 +52,63 @@ class BasePress:
         Optional method to initialize press parameters from the model
         """
         pass
+
+    @property
+    def last_context(self) -> KVContext | None:
+        """Return the most recent layer context observed by this Press."""
+
+        return getattr(self, "_last_context", None)
+
+    def _reset_context_state(self):
+        self._last_context = None
+        if not hasattr(self, "lifecycle"):
+            self.lifecycle = KVExecutionLifecycle()
+        self.lifecycle.reset()
+
+    def _make_context(
+        self,
+        module: nn.Module,
+        kwargs: dict,
+        output: list,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> KVContext:
+        """Build and expose a context without changing the Press API."""
+
+        q_len = hidden_states.shape[1]
+        cache_position = kwargs.get("cache_position")
+        lifecycle = getattr(self, "lifecycle", None)
+        if lifecycle is None:
+            lifecycle = self.lifecycle = KVExecutionLifecycle()
+        metadata = lifecycle.observe(kwargs.get("cache_position"), q_len, int(module.layer_idx))
+
+        attention = output[1] if len(output) > 1 else None
+        context = KVContext(
+            phase=metadata["phase"],
+            layer_id=int(module.layer_idx),
+            forward_id=metadata["forward_id"],
+            layer_event_index=metadata["layer_event_index"],
+            decode_step=metadata["decode_step"],
+            prefill_length=metadata["prefill_length"],
+            total_length=metadata["total_length"],
+            stored_length=int(keys.shape[2]),
+            cache_position=cache_position,
+            input_ids=kwargs.get("input_ids"),
+            position_ids=kwargs.get("position_ids"),
+            hidden_states=hidden_states,
+            keys=keys,
+            values=values,
+            query=None,
+            attention=attention,
+            cache=kwargs.get("past_key_values"),
+            recorder=getattr(self, "recorder", None),
+        )
+        self._last_context = context
+        # Existing Press implementations keep their signature.  New research
+        # code can consume the context through the existing kwargs dictionary.
+        kwargs["kv_context"] = context
+        return context
 
     def compress(
         self,
@@ -140,12 +192,13 @@ class BasePress:
         cache = kwargs["past_key_values"]
         cache_layer = cache.layers[module.layer_idx]
         q_len = hidden_states.shape[1]
+        keys, values = extract_keys_and_values(cache, module.layer_idx)
+
+        context = self._make_context(module, kwargs, output, hidden_states, keys, values)
 
         # Don't compress after pre-filling
-        if not is_prefilling(kwargs["cache_position"], q_len):
+        if context.phase is not KVPhase.PREFILL:
             return output
-
-        keys, values = extract_keys_and_values(cache, module.layer_idx)
 
         keys, values = self.compress(module, hidden_states, keys, values, output[1], kwargs)
 
@@ -192,6 +245,7 @@ class BasePress:
             logger.warning_once("Compression in Gemma3 is only applied to layer without sliding window attention")
 
         self.post_init_from_model(model)
+        self._reset_context_state()
         hooks = []
         try:
             language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
@@ -205,3 +259,4 @@ class BasePress:
         finally:
             for forward_hook in hooks:
                 forward_hook.remove()
+            self._reset_context_state()

@@ -26,7 +26,6 @@ class MergingPress(BasePress):
     Inspired by Token Merging (Bolya et al., ICLR 2023, https://arxiv.org/abs/2210.09461)
     and D2O (Wan et al., 2024, https://arxiv.org/abs/2406.13035).
 
-    🤖 automated agent contribution
 
     Parameters
     ----------
@@ -165,7 +164,7 @@ class MergingPress(BasePress):
         weight_accum = torch.zeros(bsz, num_heads, n_kept, device=keys.device, dtype=torch.float32)
         weight_accum.scatter_add_(2, target[..., 0], weights[..., 0])
 
-        # Normalized merge: only update positions that received any contribution
+        # Normalize only positions that received at least one contribution.
         kept_values = torch.where(
             (weight_accum > 0).unsqueeze(-1),
             ((kept_values.float() + value_accum) / (1.0 + weight_accum).unsqueeze(-1)).to(values.dtype),
